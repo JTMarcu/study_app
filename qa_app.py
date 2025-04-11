@@ -12,14 +12,14 @@ from langchain.chains import RetrievalQA
 from langchain.llms import HuggingFaceHub
 from langchain.prompts import PromptTemplate
 
-# 🔐 Load Hugging Face API token from .env
+# 🔐 Load Hugging Face API token
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 config = dotenv_values(dotenv_path=env_path)
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = config["HUGGINGFACEHUB_API_TOKEN"]
 hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-# 🤖 Set up LLM and embedding model
+# 🤖 LLM and Embeddings
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 llm = HuggingFaceHub(
@@ -28,30 +28,26 @@ llm = HuggingFaceHub(
     model_kwargs={"temperature": 0.7, "max_new_tokens": 256}
 )
 
-# 🧠 Prompt template to ensure grounded, accurate answers
+# 📜 Custom prompt template
 custom_prompt = PromptTemplate(
     input_variables=["context", "question"],
     template="""
-You are a helpful assistant. Use only the provided context to answer the question as accurately and clearly as possible.
-
-If the answer cannot be found in the context, say:
-"I couldn't find that in the document."
-
 Context:
 {context}
 
 Question:
 {question}
 
-Answer:
+Respond with a concise and factual answer based only on the context. 
+If the answer is not in the context, say: "I couldn't find that in the document."
 """
 )
 
-# 🧼 Utility to sanitize filenames
+# 🧼 Sanitize file names
 def clean_name(filename):
     return re.sub(r'[^a-zA-Z0-9_\-]', '_', Path(filename).stem)
 
-# 📄 PDF processor: load or create vectorstore index
+# 📄 Load or create vectorstore
 def process_pdf(file):
     pdf_name = clean_name(file.name)
     index_path = os.path.join("data", "vectorstores", pdf_name)
@@ -83,7 +79,7 @@ def process_pdf(file):
     )
     return qa_chain
 
-# 🎯 Gradio action handlers
+# 🧠 Gradio handlers
 def handle_upload(file):
     qa_chain = process_pdf(file)
     return qa_chain, "✅ PDF processed! You can now ask questions."
@@ -91,7 +87,13 @@ def handle_upload(file):
 def ask_question(qa_chain, question):
     if qa_chain is None:
         return "⚠️ Please upload and process a PDF first."
-    return qa_chain.run(question)
+    
+    raw_answer = qa_chain.run(question)
+
+    if "Answer:" in raw_answer:
+        return raw_answer.split("Answer:")[-1].strip()
+
+    return raw_answer.strip()
 
 # 🎛️ Gradio UI
 with gr.Blocks() as demo:

@@ -10,6 +10,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chains import RetrievalQA
 from langchain.llms import HuggingFaceHub
+from langchain.prompts import PromptTemplate
 
 # 🔐 Load Hugging Face API token from .env
 env_path = Path(__file__).parent / ".env"
@@ -25,6 +26,25 @@ llm = HuggingFaceHub(
     repo_id="mistralai/Mistral-7B-Instruct-v0.1",
     huggingfacehub_api_token=hf_token,
     model_kwargs={"temperature": 0.7, "max_new_tokens": 256}
+)
+
+# 🧠 Prompt template to ensure grounded, accurate answers
+custom_prompt = PromptTemplate(
+    input_variables=["context", "question"],
+    template="""
+You are a helpful assistant. Use only the provided context to answer the question as accurately and clearly as possible.
+
+If the answer cannot be found in the context, say:
+"I couldn't find that in the document."
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
 )
 
 # 🧼 Utility to sanitize filenames
@@ -58,7 +78,8 @@ def process_pdf(file):
         llm=llm,
         retriever=retriever,
         chain_type="stuff",
-        return_source_documents=False
+        return_source_documents=False,
+        chain_type_kwargs={"prompt": custom_prompt}
     )
     return qa_chain
 

@@ -12,12 +12,16 @@ from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
-# === Load .env and setup token ===
-env_path = Path(__file__).parent.parent / ".env"
+# 🔐 Load Hugging Face API token
+env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 config = dotenv_values(dotenv_path=env_path)
-os.environ["HUGGINGFACEHUB_API_TOKEN"] = config["HUGGINGFACEHUB_API_TOKEN"]
-hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+
+hf_token = config.get("HUGGINGFACEHUB_API_TOKEN")
+if not hf_token:
+    raise ValueError("❌ Missing 'HUGGINGFACEHUB_API_TOKEN' in .env file!")
+
+os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_token
 
 # === Embedding & LLM setup ===
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")

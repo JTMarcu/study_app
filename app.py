@@ -1,6 +1,5 @@
 import os
 import re
-import csv
 import json
 from pathlib import Path
 from dotenv import load_dotenv, dotenv_values
@@ -13,14 +12,14 @@ from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
-# === Load .env securely ===
-env_path = Path(__file__).parent / ".env"
+# === Load .env and setup token ===
+env_path = Path(__file__).parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 config = dotenv_values(dotenv_path=env_path)
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = config["HUGGINGFACEHUB_API_TOKEN"]
 hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
 
-# === Model & Embedding setup ===
+# === Embedding & LLM setup ===
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 llm = HuggingFaceEndpoint(
@@ -31,7 +30,7 @@ llm = HuggingFaceEndpoint(
     max_new_tokens=512
 )
 
-# === Prompt templates ===
+# === Prompt Templates ===
 qa_prompt = PromptTemplate(
     input_variables=["context", "question"],
     template="""
@@ -46,22 +45,30 @@ If the answer is not in the context, say: "I couldn't find that in the document.
 """
 )
 
-flashcard_prompt = PromptTemplate(
+key_term_prompt = PromptTemplate(
     input_variables=["chunk"],
     template="""
-You are an expert teacher. Based on the following study material, generate 2-3 helpful flashcards.
-Return a JSON array of objects like:
-[
-  {"term": "...", "definition": "...", "category": "..."},
-  ...
-]
+Extract up to 5 important technical terms from the following text. 
+Return them as a JSON list of strings (e.g., ["CPU", "RAM", ...]).
 
 Text:
 {chunk}
 """
 )
 
-flashcard_chain = flashcard_prompt | llm
+definition_prompt = PromptTemplate(
+    input_variables=["terms"],
+    template="""
+Define the following technical terms in a helpful, concise way. 
+Return a JSON array of {"term": ..., "definition": ...} objects.
+
+Terms:
+{terms}
+"""
+)
+
+term_extractor = key_term_prompt | llm
+definition_chain = definition_prompt | llm
 
 # === Utilities ===
 def clean_name(filename):
@@ -88,32 +95,39 @@ def build_qa_chain(vectorstore):
         chain_type_kwargs={"prompt": qa_prompt}
     )
 
-def generate_flashcards_from_vectorstore(vectorstore, pdf_name, max_chunks=25):
+# === Flashcard generation (2-step) ===
+def extract_and_define_terms(vectorstore, pdf_name, max_chunks=25):
     chunks = [doc.page_content for doc in vectorstore.docstore._dict.values()][:max_chunks]
+    term_set = set()
+
+    for chunk in chunks:
+        try:
+            response = term_extractor.invoke({"chunk": chunk})
+            terms = json.loads(response)
+            if isinstance(terms, list):
+                term_set.update([t.strip() for t in terms])
+        except Exception as e:
+            print("❌ Term extraction error:", e)
+
+    print(f"✅ Extracted {len(term_set)} unique terms.")
+
+    terms_list = list(term_set)
     flashcards = []
 
-    for i, chunk in enumerate(chunks):
+    batch_size = 10
+    for i in range(0, len(terms_list), batch_size):
+        batch = terms_list[i:i+batch_size]
         try:
-            response = flashcard_chain.invoke({"chunk": chunk})
-            cards = json.loads(response)
-            if isinstance(cards, dict):
-                flashcards.append(cards)
-            elif isinstance(cards, list):
-                flashcards.extend(cards)
+            response = definition_chain.invoke({"terms": json.dumps(batch)})
+            defs = json.loads(response)
+            flashcards.extend(defs)
         except Exception as e:
-            print(f"❌ Chunk {i+1} error:", e)
+            print("❌ Definition error:", e)
 
-    # Save CSV
-    output_csv = Path("data/flashcards") / f"{pdf_name}_flashcards.csv"
-    with open(output_csv, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["term", "definition", "category"])
-        writer.writeheader()
-        for card in flashcards:
-            writer.writerow({
-                "term": card.get("term", "").strip(),
-                "definition": card.get("definition", "").strip(),
-                "category": card.get("category", "General").strip()
-            })
+    # Save as JSON for now
+    output_path = Path("data/flashcards") / f"{pdf_name}_flashcards.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(flashcards, f, indent=2)
 
     return flashcards
 
@@ -128,16 +142,16 @@ def answer_question(qa_chain, question):
         return "❗ Please upload a PDF first."
     return qa_chain.run(question)
 
-def show_flashcards(vectorstore, pdf_name):
-    flashcards = generate_flashcards_from_vectorstore(vectorstore, pdf_name, max_chunks=25)
+def generate_and_show_flashcards(vectorstore, pdf_name):
+    flashcards = extract_and_define_terms(vectorstore, pdf_name, max_chunks=25)
     return "\n\n".join([
-        f"📘 **{card['term']}**\n{card['definition']} _(Category: {card.get('category', 'General')})_"
+        f"📘 **{card['term']}**\n{card['definition']}"
         for card in flashcards
     ])
 
-# === Gradio Interface ===
+# === Gradio UI ===
 with gr.Blocks() as demo:
-    gr.Markdown("# 📄 PDF Study Assistant")
+    gr.Markdown("# 📄 PDF Study Assistant (Key Term Flashcards)")
 
     qa_chain_state = gr.State()
     vectorstore_state = gr.State()
@@ -153,12 +167,12 @@ with gr.Blocks() as demo:
         question = gr.Textbox(label="Ask a Question")
         answer = gr.Textbox(label="Answer", lines=4)
 
-    flashcard_btn = gr.Button("Generate Flashcards (25 chunks max)")
+    flashcard_btn = gr.Button("Generate Flashcards (Key Terms + Definitions)")
     flashcard_display = gr.Textbox(label="Flashcards", lines=20)
 
     upload_btn.click(upload_and_index_pdf, inputs=pdf_file, outputs=[qa_chain_state, vectorstore_state, pdf_name_state, status])
     question.submit(answer_question, inputs=[qa_chain_state, question], outputs=answer)
-    flashcard_btn.click(show_flashcards, inputs=[vectorstore_state, pdf_name_state], outputs=flashcard_display)
+    flashcard_btn.click(generate_and_show_flashcards, inputs=[vectorstore_state, pdf_name_state], outputs=flashcard_display)
 
 if __name__ == "__main__":
     demo.launch()

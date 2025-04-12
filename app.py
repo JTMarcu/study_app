@@ -12,18 +12,18 @@ from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
-# 🔐 Load Hugging Face API token
+# === Load .env and Hugging Face token ===
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 config = dotenv_values(dotenv_path=env_path)
 
 hf_token = config.get("HUGGINGFACEHUB_API_TOKEN")
 if not hf_token:
-    raise ValueError("❌ Missing 'HUGGINGFACEHUB_API_TOKEN' in .env file!")
+    raise ValueError("❌ Missing HUGGINGFACEHUB_API_TOKEN in .env file!")
 
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_token
 
-# === Embedding & LLM setup ===
+# === LLM + Embedding Setup ===
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 llm = HuggingFaceEndpoint(
@@ -64,7 +64,7 @@ definition_prompt = PromptTemplate(
     input_variables=["terms"],
     template="""
 Define the following technical terms in a helpful, concise way. 
-Return a JSON array of {"term": ..., "definition": ...} objects.
+Return a JSON array of {{ "term": "...", "definition": "..." }} objects.
 
 Terms:
 {terms}
@@ -74,7 +74,17 @@ Terms:
 term_extractor = key_term_prompt | llm
 definition_chain = definition_prompt | llm
 
-# === Utilities ===
+# === Helper: Clean JSON List from LLM Response ===
+def extract_json_array(text):
+    match = re.search(r"\[.*?\]", text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+    return None
+
+# === Utility Functions ===
 def clean_name(filename):
     return re.sub(r'[^a-zA-Z0-9_\-]', '_', Path(filename).stem)
 
@@ -99,43 +109,48 @@ def build_qa_chain(vectorstore):
         chain_type_kwargs={"prompt": qa_prompt}
     )
 
-# === Flashcard generation (2-step) ===
+# === 2-Step Flashcard Flow (Terms → Definitions) ===
 def extract_and_define_terms(vectorstore, pdf_name, max_chunks=25):
     chunks = [doc.page_content for doc in vectorstore.docstore._dict.values()][:max_chunks]
     term_set = set()
 
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         try:
-            response = term_extractor.invoke({"chunk": chunk})
-            terms = json.loads(response)
-            if isinstance(terms, list):
-                term_set.update([t.strip() for t in terms])
+            response = term_extractor.invoke({"chunk": chunk}).strip()
+            print(f"🧠 Chunk {i+1} raw response: {repr(response)}")
+            terms = extract_json_array(response)
+
+            if terms and isinstance(terms, list):
+                term_set.update([t.strip() for t in terms if isinstance(t, str)])
+            else:
+                print(f"❌ Term extraction error: No valid JSON list in chunk {i+1}")
         except Exception as e:
-            print("❌ Term extraction error:", e)
+            print(f"❌ Term extraction exception in chunk {i+1}: {e}")
 
     print(f"✅ Extracted {len(term_set)} unique terms.")
 
-    terms_list = list(term_set)
     flashcards = []
-
+    terms_list = list(term_set)
     batch_size = 10
+
     for i in range(0, len(terms_list), batch_size):
-        batch = terms_list[i:i+batch_size]
+        batch = terms_list[i:i + batch_size]
         try:
-            response = definition_chain.invoke({"terms": json.dumps(batch)})
+            response = definition_chain.invoke({"terms": json.dumps(batch)}).strip()
+            print(f"📘 Definitions for batch {i // batch_size + 1}: {repr(response)}")
             defs = json.loads(response)
             flashcards.extend(defs)
         except Exception as e:
-            print("❌ Definition error:", e)
+            print(f"❌ Definition batch {i // batch_size + 1} error: {e}")
 
-    # Save as JSON for now
+    # Save to JSON
     output_path = Path("data/flashcards") / f"{pdf_name}_flashcards.json"
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(flashcards, f, indent=2)
 
     return flashcards
 
-# === Gradio Logic ===
+# === Gradio Functions ===
 def upload_and_index_pdf(file):
     vectorstore, pdf_name = load_or_create_vectorstore(file)
     qa_chain = build_qa_chain(vectorstore)
@@ -150,10 +165,10 @@ def generate_and_show_flashcards(vectorstore, pdf_name):
     flashcards = extract_and_define_terms(vectorstore, pdf_name, max_chunks=25)
     return "\n\n".join([
         f"📘 **{card['term']}**\n{card['definition']}"
-        for card in flashcards
+        for card in flashcards if "term" in card and "definition" in card
     ])
 
-# === Gradio UI ===
+# === Gradio Interface ===
 with gr.Blocks() as demo:
     gr.Markdown("# 📄 PDF Study Assistant (Key Term Flashcards)")
 

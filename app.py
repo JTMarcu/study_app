@@ -12,29 +12,29 @@ from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
-# === Load .env and Hugging Face token ===
+# === Load Hugging Face API token from .env ===
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 config = dotenv_values(dotenv_path=env_path)
-
 hf_token = config.get("HUGGINGFACEHUB_API_TOKEN")
+
 if not hf_token:
-    raise ValueError("❌ Missing HUGGINGFACEHUB_API_TOKEN in .env file!")
+    raise ValueError("❌ HUGGINGFACEHUB_API_TOKEN not found in .env!")
 
 os.environ["HUGGINGFACEHUB_API_TOKEN"] = hf_token
 
-# === LLM + Embedding Setup ===
+# === Embedding model and LLM setup ===
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
 llm = HuggingFaceEndpoint(
     repo_id="mistralai/Mistral-7B-Instruct-v0.1",
     huggingfacehub_api_token=hf_token,
     task="text-generation",
-    temperature=0.7,
-    max_new_tokens=512
+    max_new_tokens=512,
+    temperature=0.7
 )
 
-# === Prompt Templates ===
+# === Prompt templates ===
 qa_prompt = PromptTemplate(
     input_variables=["context", "question"],
     template="""
@@ -44,16 +44,15 @@ Context:
 Question:
 {question}
 
-Respond with a concise and factual answer based only on the context. 
-If the answer is not in the context, say: "I couldn't find that in the document."
+Respond with a concise and accurate answer based only on the context above.
+If the answer is not found in the context, say: "I couldn't find that in the document."
 """
 )
 
-key_term_prompt = PromptTemplate(
+term_prompt = PromptTemplate(
     input_variables=["chunk"],
     template="""
-Extract up to 5 important technical terms from the following text. 
-Return them as a JSON list of strings (e.g., ["CPU", "RAM", ...]).
+Extract up to 3 important study terms from the text below. Return them as a JSON array of strings.
 
 Text:
 {chunk}
@@ -63,18 +62,18 @@ Text:
 definition_prompt = PromptTemplate(
     input_variables=["terms"],
     template="""
-Define the following technical terms in a helpful, concise way. 
-Return a JSON array of {{ "term": "...", "definition": "..." }} objects.
+Define the following study terms clearly and concisely.
+Return a JSON array of {{"term": "...", "definition": "..."}} objects.
 
 Terms:
 {terms}
 """
 )
 
-term_extractor = key_term_prompt | llm
+term_chain = term_prompt | llm
 definition_chain = definition_prompt | llm
 
-# === Helper: Clean JSON List from LLM Response ===
+# === Utilities ===
 def extract_json_array(text):
     match = re.search(r"\[.*?\]", text, re.DOTALL)
     if match:
@@ -84,101 +83,95 @@ def extract_json_array(text):
             return None
     return None
 
-# === Utility Functions ===
 def clean_name(filename):
     return re.sub(r'[^a-zA-Z0-9_\-]', '_', Path(filename).stem)
 
 def load_or_create_vectorstore(file):
-    pdf_name = clean_name(file.name)
-    path = f"data/vectorstores/{pdf_name}"
-    if os.path.exists(path):
-        vs = FAISS.load_local(path, embedding_model, allow_dangerous_deserialization=True)
+    name = clean_name(file.name)
+    index_path = f"data/vectorstores/{name}"
+
+    if os.path.exists(index_path):
+        vs = FAISS.load_local(index_path, embedding_model, allow_dangerous_deserialization=True)
     else:
         docs = PyPDFLoader(file.name).load()
         chunks = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100).split_documents(docs)
         vs = FAISS.from_documents(chunks, embedding_model)
-        vs.save_local(path)
-    return vs, pdf_name
+        vs.save_local(index_path)
 
-def build_qa_chain(vectorstore):
+    return vs, name
+
+def build_qa_chain(vs):
     return RetrievalQA.from_chain_type(
         llm=llm,
-        retriever=vectorstore.as_retriever(),
+        retriever=vs.as_retriever(),
         chain_type="stuff",
         return_source_documents=False,
         chain_type_kwargs={"prompt": qa_prompt}
     )
 
-# === 2-Step Flashcard Flow (Terms → Definitions) ===
-def extract_and_define_terms(vectorstore, pdf_name, max_chunks=25):
-    chunks = [doc.page_content for doc in vectorstore.docstore._dict.values()][:max_chunks]
-    term_set = set()
+def extract_and_define_terms(vs, name, max_chunks=10):
+    chunks = [doc.page_content for doc in vs.docstore._dict.values()][:max_chunks]
+    terms = set()
 
     for i, chunk in enumerate(chunks):
         try:
-            response = term_extractor.invoke({"chunk": chunk}).strip()
-            print(f"🧠 Chunk {i+1} raw response: {repr(response)}")
-            terms = extract_json_array(response)
-
-            if terms and isinstance(terms, list):
-                term_set.update([t.strip() for t in terms if isinstance(t, str)])
-            else:
-                print(f"❌ Term extraction error: No valid JSON list in chunk {i+1}")
+            result = term_chain.invoke({"chunk": chunk}).strip()
+            print(f"🧠 Chunk {i+1}: {result}")
+            parsed = extract_json_array(result)
+            if parsed:
+                terms.update([t.strip() for t in parsed if isinstance(t, str)])
         except Exception as e:
-            print(f"❌ Term extraction exception in chunk {i+1}: {e}")
-
-    print(f"✅ Extracted {len(term_set)} unique terms.")
+            print(f"❌ Term extraction error on chunk {i+1}: {e}")
 
     flashcards = []
-    terms_list = list(term_set)
-    batch_size = 10
+    term_list = list(terms)
 
-    for i in range(0, len(terms_list), batch_size):
-        batch = terms_list[i:i + batch_size]
+    for i in range(0, len(term_list), 10):
+        batch = term_list[i:i + 10]
         try:
-            response = definition_chain.invoke({"terms": json.dumps(batch)}).strip()
-            print(f"📘 Definitions for batch {i // batch_size + 1}: {repr(response)}")
-            defs = json.loads(response)
-            flashcards.extend(defs)
+            result = definition_chain.invoke({"terms": json.dumps(batch)}).strip()
+            print(f"📘 Definitions batch {i//10+1}: {result}")
+            definitions = extract_json_array(result)
+            if definitions:
+                flashcards.extend(definitions)
         except Exception as e:
-            print(f"❌ Definition batch {i // batch_size + 1} error: {e}")
+            print(f"❌ Definition batch {i//10+1} error: {e}")
 
-    # Save to JSON
-    output_path = Path("data/flashcards") / f"{pdf_name}_flashcards.json"
+    output_path = Path("data/flashcards") / f"{name}_flashcards.json"
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(flashcards, f, indent=2)
 
     return flashcards
 
-# === Gradio Functions ===
-def upload_and_index_pdf(file):
-    vectorstore, pdf_name = load_or_create_vectorstore(file)
-    qa_chain = build_qa_chain(vectorstore)
-    return qa_chain, vectorstore, pdf_name, f"✅ {file.name} loaded."
+# === Gradio Actions ===
+def upload_and_process(file):
+    vs, name = load_or_create_vectorstore(file)
+    chain = build_qa_chain(vs)
+    return chain, vs, name, f"✅ {file.name} processed."
 
-def answer_question(qa_chain, question):
-    if not qa_chain:
-        return "❗ Please upload a PDF first."
-    return qa_chain.run(question)
+def ask(chain, q):
+    if not chain:
+        return "⚠️ Please upload a PDF first."
+    return chain.run(q)
 
-def generate_and_show_flashcards(vectorstore, pdf_name):
-    flashcards = extract_and_define_terms(vectorstore, pdf_name, max_chunks=25)
+def create_flashcards(vs, name):
+    cards = extract_and_define_terms(vs, name)
     return "\n\n".join([
-        f"📘 **{card['term']}**\n{card['definition']}"
-        for card in flashcards if "term" in card and "definition" in card
+        f"📘 **{c['term']}**\n{c['definition']}"
+        for c in cards if "term" in c and "definition" in c
     ])
 
-# === Gradio Interface ===
+# === Gradio UI ===
 with gr.Blocks() as demo:
-    gr.Markdown("# 📄 PDF Study Assistant (Key Term Flashcards)")
+    gr.Markdown("# 📚 PDF Study Assistant")
 
     qa_chain_state = gr.State()
     vectorstore_state = gr.State()
-    pdf_name_state = gr.State()
+    name_state = gr.State()
 
     with gr.Row():
-        pdf_file = gr.File(label="Upload PDF", file_types=[".pdf"])
-        upload_btn = gr.Button("Process PDF")
+        pdf = gr.File(label="Upload PDF", file_types=[".pdf"])
+        process_btn = gr.Button("Process PDF")
 
     status = gr.Textbox(label="Status")
 
@@ -186,12 +179,12 @@ with gr.Blocks() as demo:
         question = gr.Textbox(label="Ask a Question")
         answer = gr.Textbox(label="Answer", lines=4)
 
-    flashcard_btn = gr.Button("Generate Flashcards (Key Terms + Definitions)")
-    flashcard_display = gr.Textbox(label="Flashcards", lines=20)
+    flashcard_btn = gr.Button("Generate Flashcards")
+    flashcards = gr.Textbox(label="Flashcards", lines=20)
 
-    upload_btn.click(upload_and_index_pdf, inputs=pdf_file, outputs=[qa_chain_state, vectorstore_state, pdf_name_state, status])
-    question.submit(answer_question, inputs=[qa_chain_state, question], outputs=answer)
-    flashcard_btn.click(generate_and_show_flashcards, inputs=[vectorstore_state, pdf_name_state], outputs=flashcard_display)
+    process_btn.click(upload_and_process, inputs=pdf, outputs=[qa_chain_state, vectorstore_state, name_state, status])
+    question.submit(ask, inputs=[qa_chain_state, question], outputs=answer)
+    flashcard_btn.click(create_flashcards, inputs=[vectorstore_state, name_state], outputs=flashcards)
 
 if __name__ == "__main__":
     demo.launch()
